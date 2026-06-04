@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Excel Trace Agent - Scalable Agentic Chat System for Processing Large Excel Files'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+    Description: Environment name (dev, staging, prod)
+
+Resources:
+  # S3 Bucket for Excel files and results
+  ExcelTraceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'excel-trace-agent-bucket-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldFiles
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 7
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedHeaders:
+              - '*'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB Table for job tracking
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserJobsIndex
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # SQS Queue for job processing
+  ExcelTraceQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: excel-trace-queue
+      VisibilityTimeout: 900  # 15 minutes
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ExcelTraceDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # Dead Letter Queue
+  ExcelTraceDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: excel-trace-dlq
+      MessageRetentionPeriod: 1209600
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ExcelTraceLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ExcelTraceLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ExcelTraceBucket.Arn
+                  - !Sub '${ExcelTraceBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !Sub '${JobsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt ExcelTraceQueue.Arn
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJob
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+
+  # Lambda Function for SQS processing
+  SQSWorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: excel-trace-sqs-worker
+      Runtime: python3.11
+      Handler: sqs_worker.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900  # 15 minutes max
+      MemorySize: 2048
+      Code:
+        ZipFile: |
+          # Placeholder - deploy actual code via CI/CD
+          def lambda_handler(event, context):
+              print("Placeholder function")
+              return {'statusCode': 200}
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ExcelTraceBucket
+          JOBS_TABLE: !Ref JobsTable
+
+  # SQS Event Source Mapping
+  LambdaSQSEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ExcelTraceQueue.Arn
+      FunctionName: !Ref SQSWorkerLambda
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+
+  # Glue Job Role
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ExcelTraceGlueRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ExcelTraceBucket.Arn
+                  - !Sub '${ExcelTraceBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt JobsTable.Arn
+
+  # Glue Job for Excel Processing
+  ExcelProcessorGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: excel-processor-job
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ExcelTraceBucket}/glue-scripts/excel_processor.py'
+      DefaultArguments:
+        '--job-language': python
+        '--enable-metrics': 'true'
+        '--enable-spark-ui': 'true'
+        '--enable-job-insights': 'true'
+        '--TempDir': !Sub 's3://${ExcelTraceBucket}/temp/'
+      GlueVersion: '4.0'
+      MaxRetries: 2
+      Timeout: 2880  # 48 hours
+      NumberOfWorkers: 10
+      WorkerType: G.1X
+      ExecutionProperty:
+        MaxConcurrentRuns: 10
+
+  # Glue Job for Transformations
+  TransformationGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: excel-transformation-job
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ExcelTraceBucket}/glue-scripts/transformation_template.py'
+      DefaultArguments:
+        '--job-language': python
+        '--enable-metrics': 'true'
+      GlueVersion: '4.0'
+      MaxRetries: 1
+      Timeout: 480  # 8 hours
+      NumberOfWorkers: 5
+      WorkerType: G.1X
+      ExecutionProperty:
+        MaxConcurrentRuns: 20
+
+  # CloudWatch Log Group
+  APILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/excel-trace-api
+      RetentionInDays: 30
+
+  # CloudWatch Alarms
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ExcelTrace-HighErrorRate
+      AlarmDescription: Alert when Lambda error rate is high
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SQSWorkerLambda
+
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ExcelTrace-DLQDepth
+      AlarmDescription: Alert when messages are in DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ExcelTraceDeadLetterQueue.QueueName
+
+Outputs:
+  BucketName:
+    Description: S3 Bucket for Excel files
+    Value: !Ref ExcelTraceBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  QueueURL:
+    Description: SQS Queue URL
+    Value: !Ref ExcelTraceQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-QueueURL'
+
+  TableName:
+    Description: DynamoDB Jobs Table
+    Value: !Ref JobsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  LambdaFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt SQSWorkerLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+
+  GlueJobName:
+    Description: Glue Job Name
+    Value: !Ref ExcelProcessorGlueJob
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueJobName'
